@@ -1,1 +1,18 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
 
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test (std only)
+        run: cargo test
+      - name: Test (with k256 backends)
+        run: cargo test --features k256
+      - name: Clippy
+        run: cargo clippy --all-features
