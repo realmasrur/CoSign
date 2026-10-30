@@ -1,0 +1,16 @@
+[package]
+name = "cosign-policy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Independent co-signing and policy engine that guards crypto-exchange withdrawals"
+license-file = "LICENSE"
+publish = false
+readme = "README.md"
+keywords = ["crypto", "security", "multisig", "custody", "policy"]
+
+[dependencies]
+k256 = { version = "0.13", optional = true }
+
+# Default build is std-only. `--features k256` enables LocalKey and Secp256k1Verifier.
+# Cargo still needs registry access to resolve the optional dependency.
