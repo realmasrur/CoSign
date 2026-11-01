@@ -32,3 +32,7 @@ reviewed independently before it guards live funds.
 5. A compromised feed that sends conflicting decimals for an asset can stall that asset's price refresh. This fails closed.
 6. The audit-log chain detects edits, deletions and reordering. Detecting truncation of the newest entries requires anchoring the head hash outside CoSign.
 7. Protection applies only to wallets where CoSign is a required signer.
+8. Limits bound the loss; they do not detect abnormal activity that stays within them. Anomaly detection is not part of this release.
+9. The global cross-chain limit has no runtime change path by design. Changing it requires redeploying the attested enclave, so size it with operational headroom.
+10. Raw transactions are analyzed from the exact bytes supplied for signing. The caller must supply the bytes that the key or MPC backend will actually sign.
+11. Prices, `EvmConfig` and policy are per chain; a misconfigured chain id fails closed because transactions and signed prices bind the chain id.
