@@ -13,6 +13,7 @@ pub mod price;
 pub mod signer;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 pub type TxHash = [u8; 32];
 
@@ -30,6 +31,8 @@ pub enum Risk {
     /// Any change to who or what controls a wallet or contract: owners, threshold,
     /// guard, modules, fallback handler, contract ownership or admin.
     OwnerChange,
+    /// EIP-7702 delegation of an account to contract code that is not explicitly allowed.
+    Delegation,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +101,8 @@ pub enum Reason {
     TxLimit,
     UnlistedDestination(String),
     WindowLimit,
+    /// The cross-chain velocity limit shared by all engines would be exceeded.
+    GlobalLimit,
     SignerFailure,
     AuditFailure,
 }
@@ -111,8 +116,53 @@ pub enum Decision {
     Block(Vec<Reason>),
 }
 
+/// Cross-chain velocity limit shared by every engine, so draining many wallets on
+/// many chains still hits one ceiling. Immutable at runtime on purpose: changing it
+/// means redeploying the attested enclave, so no remote change path exists.
+pub struct GlobalLimit {
+    window_secs: u64,
+    max_usd_cents: u128,
+    spent: VecDeque<(u64, u128)>,
+}
+
+pub type SharedLimit = Arc<Mutex<GlobalLimit>>;
+
+impl GlobalLimit {
+    pub fn shared(window_secs: u64, max_usd_cents: u128) -> SharedLimit {
+        Arc::new(Mutex::new(Self { window_secs, max_usd_cents, spent: VecDeque::new() }))
+    }
+
+    fn used(&self, now: u64) -> u128 {
+        self.spent
+            .iter()
+            .filter(|(t, _)| t.saturating_add(self.window_secs) > now)
+            .fold(0u128, |a, &(_, v)| a.saturating_add(v))
+    }
+
+    fn fits(&self, now: u64, total: u128) -> bool {
+        self.used(now).saturating_add(total) <= self.max_usd_cents
+    }
+
+    /// Atomic check-and-reserve, so concurrent engines cannot both slip under the cap.
+    fn reserve(&mut self, now: u64, total: u128) -> bool {
+        while let Some(&(t, _)) = self.spent.front() {
+            if t.saturating_add(self.window_secs) <= now {
+                self.spent.pop_front();
+            } else {
+                break;
+            }
+        }
+        if !self.fits(now, total) {
+            return false;
+        }
+        self.spent.push_back((now, total));
+        true
+    }
+}
+
 pub struct Engine {
     policy: Policy,
+    global: Option<SharedLimit>,
     paused: bool,
     spent: VecDeque<(u64, u128)>,
     pending: HashMap<TxHash, u64>,
@@ -120,9 +170,14 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(policy: Policy) -> Self {
-        Self { policy, paused: false, spent: VecDeque::new(), pending: HashMap::new() }
+        Self { policy, global: None, paused: false, spent: VecDeque::new(), pending: HashMap::new() }
     }
 
+    /// Attach the shared cross-chain limit.
+    pub fn with_global(mut self, g: SharedLimit) -> Self {
+        self.global = Some(g);
+        self
+    }
     pub fn pause(&mut self) {
         self.paused = true;
     }
@@ -177,6 +232,13 @@ impl Engine {
         if used.saturating_add(total) > p.max_window_usd_cents {
             reasons.push(Reason::WindowLimit);
         }
+        let global_ok = match &self.global {
+            None => true,
+            Some(g) => g.lock().map(|g| g.fits(now, total)).unwrap_or(false), // poisoned lock blocks
+        };
+        if !global_ok {
+            reasons.push(Reason::GlobalLimit);
+        }
 
         if !reasons.is_empty() {
             self.pending.remove(&sim.tx_hash);
@@ -191,6 +253,12 @@ impl Engine {
             self.pending.remove(&sim.tx_hash);
         }
 
+        if let Some(g) = &self.global {
+            let reserved = g.lock().map(|mut g| g.reserve(now, total)).unwrap_or(false);
+            if !reserved {
+                return Decision::Block(vec![Reason::GlobalLimit]);
+            }
+        }
         self.spent.push_back((now, total)); // reserve at approval, not at broadcast
         Decision::Approve(sim.tx_hash)
     }
@@ -309,5 +377,17 @@ mod tests {
         assert_eq!(a.digest(), b.digest());
         b.delay_secs += 1;
         assert_ne!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn global_limit_is_shared_across_engines_and_recovers() {
+        let g = GlobalLimit::shared(3_600, 1_000);
+        let mut a = engine().with_global(g.clone());
+        let mut b = engine().with_global(g);
+        assert_eq!(a.evaluate(&sim(1, "0xA", 400), 0), Decision::Approve([1; 32]));
+        assert_eq!(b.evaluate(&sim(2, "0xA", 400), 0), Decision::Approve([2; 32]));
+        let d = a.evaluate(&sim(3, "0xA", 400), 10);
+        assert!(matches!(d, Decision::Block(ref r) if r == &vec![Reason::GlobalLimit]));
+        assert_eq!(a.evaluate(&sim(3, "0xA", 400), 3_600), Decision::Approve([3; 32]));
     }
 }

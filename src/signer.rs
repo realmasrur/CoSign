@@ -8,8 +8,8 @@
 use crate::audit::{hex32, Log, Sink};
 use crate::change::Guard;
 use crate::control::{Approval, Quorum, Verifier};
-use crate::evm::{analyze, EvmConfig, Pricer, SafeTx, Word};
-use crate::{Decision, Engine, Reason, TxHash};
+use crate::evm::{analyze, analyze_authorization, analyze_raw, EvmConfig, Pricer, SafeTx, Word};
+use crate::{Decision, Engine, Reason, Simulation, TxHash};
 use std::collections::HashMap;
 
 /// r(32) | s(32) | v(1), v = 27/28, as Safe expects for ECDSA owner signatures.
@@ -71,8 +71,25 @@ impl<K: Key, S: Sink, V: Verifier> CoSigner<K, S, V> {
         true
     }
 
+    /// Safe multisig transaction.
     pub fn request(&mut self, pricer: &dyn Pricer, tx: &SafeTx, claimed: Word, now: u64) -> Response {
         let sim = analyze(&self.cfg, pricer, tx, claimed);
+        self.decide(sim, now)
+    }
+
+    /// Raw hot-wallet transaction: the exact bytes that will be hashed and signed.
+    pub fn request_raw(&mut self, pricer: &dyn Pricer, unsigned: &[u8], claimed: Word, now: u64) -> Response {
+        let sim = analyze_raw(&self.cfg, pricer, unsigned, claimed);
+        self.decide(sim, now)
+    }
+
+    /// EIP-7702 authorization preimage (`0x05 || rlp([chain_id, address, nonce])`).
+    pub fn request_authorization(&mut self, preimage: &[u8], claimed: Word, now: u64) -> Response {
+        let sim = analyze_authorization(&self.cfg, preimage, claimed);
+        self.decide(sim, now)
+    }
+
+    fn decide(&mut self, sim: Simulation, now: u64) -> Response {
 
         let cached = if !sim.incomplete && !self.engine.is_paused() {
             self.signed.get(&sim.tx_hash).copied()
@@ -148,9 +165,10 @@ mod tests {
     use crate::audit::{verify, Entry, SinkError};
     use crate::change::ChangeError;
     use crate::control::Tag;
-    use crate::evm::{hex, safe_tx_hash, word, Addr, Asset};
+    use crate::evm::{hex, safe_tx_hash, testenc, word, Addr, Asset};
+    use crate::keccak::keccak256;
     use crate::price::{PriceBook, SignedPrice};
-    use crate::Policy;
+    use crate::{Policy, Risk};
     use std::cell::RefCell;
 
     struct Flat;
@@ -191,7 +209,7 @@ mod tests {
     type Test<S> = CoSigner<MockKey, S, Tag>;
 
     fn cfg() -> EvmConfig {
-        EvmConfig { chain_id: 1, safe: [0x5a; 20], multisend: Default::default() }
+        EvmConfig { chain_id: 1, safe: [0x5a; 20], ..Default::default() }
     }
 
     fn signer_with<S: Sink>(max_window: u128, fail: bool, sink: S) -> Test<S> {
@@ -437,5 +455,17 @@ mod tests {
         };
         book.ingest(10, &[mk(1), mk(2)]); // $0.01 per unit, so 600 units = 600 cents
         assert!(matches!(s.request(&book, &t, claimed, 10), Response::Signed(_)));
+    }
+
+    #[test]
+    fn hot_wallet_raw_tx_is_signed_but_7702_delegation_is_not() {
+        let mut s = signer(20_000, false);
+        let raw = testenc::type2(1, &TOKEN, 0, &transfer_tx(0, TOKEN, 600).data);
+        assert!(matches!(s.request_raw(&Flat, &raw, keccak256(&raw), 0), Response::Signed(_)));
+
+        let auth = testenc::authorization(1, &EVIL, 0);
+        let r = s.request_authorization(&auth, keccak256(&auth), 1);
+        assert!(matches!(r, Response::Blocked(ref x) if x.contains(&Reason::Risk(Risk::Delegation))));
+        assert_eq!(s.key.calls.borrow().len(), 1); // only the legitimate transfer reached the key
     }
 }

@@ -24,12 +24,16 @@ pub trait Pricer {
     fn usd_cents(&self, asset: &Asset, amount: u128) -> Option<u128>;
 }
 
+#[derive(Default)]
 pub struct EvmConfig {
     pub chain_id: u64,
-    /// The guarded Safe.
+    /// The guarded account: the Safe, or the hot wallet for raw transactions.
     pub safe: Addr,
     /// The only contracts a delegatecall may target (MultiSend variants).
     pub multisend: HashSet<Addr>,
+    /// Contracts an account may delegate to via EIP-7702. Empty by default:
+    /// exchange hot wallets have no reason to delegate.
+    pub allowed_delegates: HashSet<Addr>,
 }
 
 pub struct SafeTx {
@@ -255,6 +259,217 @@ pub fn analyze(cfg: &EvmConfig, pricer: &dyn Pricer, tx: &SafeTx, claimed: Word)
     Simulation { tx_hash: digest, outflows: c.out, risks: c.risks, incomplete: c.incomplete }
 }
 
+
+// ---------- raw EVM transactions and EIP-7702 authorizations ----------
+//
+// For hot wallets signed by MPC or a plain key. The caller supplies the exact
+// bytes that will be hashed and signed (type byte || RLP for typed transactions,
+// the EIP-155 payload for legacy, 0x05 || RLP for a 7702 authorization). CoSign
+// parses and hashes those SAME bytes, so what it checks is what gets signed.
+
+enum Item<'a> {
+    Str(&'a [u8]),
+    List(&'a [u8]),
+}
+
+/// Strict, canonical RLP: any non-canonical encoding is rejected.
+fn next(b: &[u8]) -> Option<(Item<'_>, &[u8])> {
+    let (&p, rest) = b.split_first()?;
+    let (is_list, len, rest) = match p {
+        0x00..=0x7f => return Some((Item::Str(&b[..1]), rest)),
+        0x80..=0xb7 => (false, (p - 0x80) as usize, rest),
+        0xc0..=0xf7 => (true, (p - 0xc0) as usize, rest),
+        _ => {
+            let is_list = p >= 0xf8;
+            let n = (p - if is_list { 0xf7 } else { 0xb7 }) as usize;
+            if rest.len() < n || rest[0] == 0 {
+                return None;
+            }
+            let mut l = 0usize;
+            for &x in &rest[..n] {
+                l = l.checked_mul(256)?.checked_add(x as usize)?;
+            }
+            if l <= 55 {
+                return None;
+            }
+            (is_list, l, &rest[n..])
+        }
+    };
+    if rest.len() < len {
+        return None;
+    }
+    let (body, tail) = rest.split_at(len);
+    if !is_list && len == 1 && body[0] < 0x80 {
+        return None;
+    }
+    Some((if is_list { Item::List(body) } else { Item::Str(body) }, tail))
+}
+
+fn items(mut b: &[u8]) -> Option<Vec<Item<'_>>> {
+    let mut v = Vec::new();
+    while !b.is_empty() {
+        let (it, rest) = next(b)?;
+        v.push(it);
+        b = rest;
+    }
+    Some(v)
+}
+
+fn bytes<'a>(it: &Item<'a>) -> Option<&'a [u8]> {
+    match it {
+        Item::Str(x) => Some(*x),
+        _ => None,
+    }
+}
+
+fn list<'a>(it: &Item<'a>) -> Option<&'a [u8]> {
+    match it {
+        Item::List(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// Canonical big-endian integer; anything wider than 128 bits saturates and trips limits.
+fn uint(s: &[u8]) -> Option<u128> {
+    if s.first() == Some(&0) || s.len() > 32 {
+        return None;
+    }
+    Some(if s.len() > 16 { u128::MAX } else { s.iter().fold(0u128, |a, &b| (a << 8) | b as u128) })
+}
+
+/// A delegation is acceptable only on this chain, to an allowed contract, or to the
+/// zero address (which clears a delegation). Chain id 0 means "every chain": never.
+fn delegation_ok(cfg: &EvmConfig, chain: u128, delegate: &Addr) -> bool {
+    chain == cfg.chain_id as u128 && (*delegate == [0u8; 20] || cfg.allowed_delegates.contains(delegate))
+}
+
+impl Ctx<'_> {
+    fn raw(&mut self, u: &[u8]) -> Option<()> {
+        let first = *u.first()?;
+        // (payload, chain, to, value, data, authorization_list, field count)
+        let (payload, chain_i, to_i, value_i, data_i, auth_i, n) = match first {
+            0x01 => (&u[1..], 0, 4, 5, 6, None, 8),
+            0x02 => (&u[1..], 0, 5, 6, 7, None, 9),
+            0x04 => (&u[1..], 0, 5, 6, 7, Some(9), 10),
+            0xc0..=0xff => (u, 6, 3, 4, 5, None, 9),
+            _ => return None,
+        };
+        let (outer, rest) = next(payload)?;
+        if !rest.is_empty() {
+            return None;
+        }
+        let f = items(list(&outer)?)?;
+        if f.len() != n {
+            return None;
+        }
+        if first >= 0xc0 && !(bytes(&f[7])?.is_empty() && bytes(&f[8])?.is_empty()) {
+            return None; // EIP-155 payload ends with two empty fields
+        }
+        if uint(bytes(&f[chain_i])?)? != self.cfg.chain_id as u128 {
+            return None; // wrong chain, or a pre-EIP-155 transaction
+        }
+        let to = Addr::try_from(bytes(&f[to_i])?).ok()?; // contract creation is rejected
+        let value = uint(bytes(&f[value_i])?)?;
+        let data = bytes(&f[data_i])?;
+        if let Some(i) = auth_i {
+            for entry in items(list(&f[i])?)? {
+                let e = items(list(&entry)?)?;
+                if e.len() != 6 {
+                    return None;
+                }
+                let chain = uint(bytes(&e[0])?)?;
+                let delegate = Addr::try_from(bytes(&e[1])?).ok()?;
+                if !delegation_ok(self.cfg, chain, &delegate) {
+                    self.risks.push(Risk::Delegation);
+                }
+            }
+        }
+        self.action(false, to, value, data, false);
+        Some(())
+    }
+}
+
+/// Raw transaction from a hot wallet (legacy EIP-155, 2930, 1559 or 7702 type).
+pub fn analyze_raw(cfg: &EvmConfig, pricer: &dyn Pricer, unsigned: &[u8], claimed: Word) -> Simulation {
+    let digest = keccak256(unsigned);
+    let mut c = Ctx { cfg, pricer, out: Vec::new(), risks: Vec::new(), incomplete: digest != claimed };
+    if c.raw(unsigned).is_none() {
+        c.incomplete = true;
+    }
+    Simulation { tx_hash: digest, outflows: c.out, risks: c.risks, incomplete: c.incomplete }
+}
+
+/// A request to sign an EIP-7702 authorization (`0x05 || rlp([chain_id, address, nonce])`).
+/// This is the move that turned Binance hot wallets into sweepers in October 2026.
+pub fn analyze_authorization(cfg: &EvmConfig, preimage: &[u8], claimed: Word) -> Simulation {
+    let digest = keccak256(preimage);
+    let parsed = (|| -> Option<(u128, Addr)> {
+        let (&magic, body) = preimage.split_first()?;
+        if magic != 0x05 {
+            return None;
+        }
+        let (outer, rest) = next(body)?;
+        if !rest.is_empty() {
+            return None;
+        }
+        let f = items(list(&outer)?)?;
+        if f.len() != 3 {
+            return None;
+        }
+        uint(bytes(&f[2])?)?;
+        Some((uint(bytes(&f[0])?)?, Addr::try_from(bytes(&f[1])?).ok()?))
+    })();
+    let mut risks = Vec::new();
+    let mut incomplete = digest != claimed;
+    match parsed {
+        Some((chain, delegate)) if !delegation_ok(cfg, chain, &delegate) => risks.push(Risk::Delegation),
+        Some(_) => {}
+        None => incomplete = true,
+    }
+    Simulation { tx_hash: digest, outflows: Vec::new(), risks, incomplete }
+}
+
+#[cfg(test)]
+pub(crate) mod testenc {
+    use super::Addr;
+
+    fn hdr(base: u8, len: usize) -> Vec<u8> {
+        if len <= 55 {
+            vec![base + len as u8]
+        } else {
+            let l: Vec<u8> = len.to_be_bytes().into_iter().skip_while(|&x| x == 0).collect();
+            [vec![base + 55 + l.len() as u8], l].concat()
+        }
+    }
+    pub fn rlp_str(b: &[u8]) -> Vec<u8> {
+        if b.len() == 1 && b[0] < 0x80 { b.to_vec() } else { [hdr(0x80, b.len()), b.to_vec()].concat() }
+    }
+    pub fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+        let p = items.concat();
+        [hdr(0xc0, p.len()), p].concat()
+    }
+    pub fn u(n: u128) -> Vec<u8> {
+        let b: Vec<u8> = n.to_be_bytes().into_iter().skip_while(|&x| x == 0).collect();
+        rlp_str(&b)
+    }
+    pub fn type2(chain: u128, to: &[u8], value: u128, data: &[u8]) -> Vec<u8> {
+        let f = [u(chain), u(7), u(1), u(2), u(21_000), rlp_str(to), u(value), rlp_str(data), rlp_list(&[])];
+        [vec![2], rlp_list(&f)].concat()
+    }
+    pub fn type4(chain: u128, to: &[u8], value: u128, data: &[u8], auths: &[(u128, Addr)]) -> Vec<u8> {
+        let a: Vec<Vec<u8>> =
+            auths.iter().map(|(c, d)| rlp_list(&[u(*c), rlp_str(d), u(0), u(0), u(1), u(1)])).collect();
+        let f = [u(chain), u(7), u(1), u(2), u(21_000), rlp_str(to), u(value), rlp_str(data), rlp_list(&[]), rlp_list(&a)];
+        [vec![4], rlp_list(&f)].concat()
+    }
+    pub fn legacy(chain: u128, to: &[u8], value: u128, data: &[u8]) -> Vec<u8> {
+        rlp_list(&[u(7), u(1), u(21_000), rlp_str(to), u(value), rlp_str(data), u(chain), rlp_str(&[]), rlp_str(&[])])
+    }
+    pub fn authorization(chain: u128, delegate: &Addr, nonce: u128) -> Vec<u8> {
+        [vec![5], rlp_list(&[u(chain), rlp_str(delegate), u(nonce)])].concat()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,7 +494,7 @@ mod tests {
     const MULTISEND: Addr = [0x77; 20];
 
     fn cfg() -> EvmConfig {
-        EvmConfig { chain_id: 1, safe: [0x5a; 20], multisend: [MULTISEND].into_iter().collect() }
+        EvmConfig { chain_id: 1, safe: [0x5a; 20], multisend: [MULTISEND].into_iter().collect(), ..Default::default() }
     }
 
     fn tx(op: u8, to: Addr, data: Vec<u8>) -> SafeTx {
@@ -376,5 +591,80 @@ mod tests {
         let mut g = tx(0, TOKEN, transfer(GOOD, 1));
         g.gas_price = word(1);
         assert!(run(&g).incomplete);
+    }
+
+    fn raw(tx: &[u8]) -> Simulation {
+        analyze_raw(&cfg(), &Flat, tx, keccak256(tx))
+    }
+
+    #[test]
+    fn raw_transfers_are_decoded_and_the_signed_bytes_are_the_parsed_bytes() {
+        let erc20 = testenc::type2(1, &TOKEN, 0, &transfer(GOOD, 100));
+        let s = raw(&erc20);
+        assert!(!s.incomplete && s.risks.is_empty());
+        assert_eq!((s.outflows[0].to.clone(), s.outflows[0].usd_cents), (hex(&GOOD), 100));
+        assert_eq!(s.tx_hash, keccak256(&erc20));
+        assert_eq!(engine().evaluate(&s, 0), Decision::Approve(s.tx_hash));
+
+        assert_eq!(raw(&testenc::type2(1, &GOOD, 500, &[])).outflows[0].usd_cents, 500);
+        assert!(!raw(&testenc::legacy(1, &GOOD, 5, &[])).incomplete);
+        assert!(!raw(&testenc::type4(1, &GOOD, 5, &[], &[])).incomplete);
+    }
+
+    #[test]
+    fn malformed_or_foreign_raw_transactions_fail_closed() {
+        let good = testenc::type2(1, &GOOD, 5, &[]);
+        assert!(analyze_raw(&cfg(), &Flat, &good, [0u8; 32]).incomplete); // digest mismatch
+        let mut trailing = good.clone();
+        trailing.push(0);
+        let non_canonical = [
+            vec![2],
+            testenc::rlp_list(&[
+                testenc::u(1), vec![0x81, 0x07], testenc::u(1), testenc::u(2), testenc::u(21_000),
+                testenc::rlp_str(&GOOD), testenc::u(5), testenc::rlp_str(&[]), testenc::rlp_list(&[]),
+            ]),
+        ]
+        .concat();
+        for tx in [
+            testenc::type2(5, &GOOD, 5, &[]), // wrong chain
+            testenc::type2(1, &[], 5, &[]),   // contract creation
+            trailing,
+            non_canonical,
+            vec![3, 0xc0], // blob transaction type
+            vec![],
+        ] {
+            assert!(raw(&tx).incomplete);
+        }
+    }
+
+    #[test]
+    fn eip7702_delegations_are_blocked_unless_allowed() {
+        let evil = [(1u128, EVIL)];
+        let t = testenc::type4(1, &GOOD, 0, &[], &evil);
+        assert_eq!(raw(&t).risks, vec![Risk::Delegation]);
+
+        let allowed = EvmConfig { allowed_delegates: [EVIL].into_iter().collect(), ..cfg() };
+        assert!(analyze_raw(&allowed, &Flat, &t, keccak256(&t)).risks.is_empty());
+
+        let all_chains = testenc::type4(1, &GOOD, 0, &[], &[(0, EVIL)]);
+        assert_eq!(analyze_raw(&allowed, &Flat, &all_chains, keccak256(&all_chains)).risks, vec![Risk::Delegation]);
+        assert!(raw(&testenc::type4(1, &GOOD, 0, &[], &[(1, [0u8; 20])])).risks.is_empty()); // clearing is fine
+    }
+
+    #[test]
+    fn authorization_signing_requests_are_checked() {
+        let check = |c: &EvmConfig, p: &[u8]| analyze_authorization(c, p, keccak256(p));
+        let evil = testenc::authorization(1, &EVIL, 0);
+        assert_eq!(check(&cfg(), &evil).risks, vec![Risk::Delegation]);
+
+        let allowed = EvmConfig { allowed_delegates: [EVIL].into_iter().collect(), ..cfg() };
+        let s = check(&allowed, &evil);
+        assert!(s.risks.is_empty() && !s.incomplete);
+        assert_eq!(check(&allowed, &testenc::authorization(0, &EVIL, 0)).risks, vec![Risk::Delegation]);
+
+        let mut wrong_magic = evil.clone();
+        wrong_magic[0] = 6;
+        assert!(check(&cfg(), &wrong_magic).incomplete);
+        assert!(analyze_authorization(&cfg(), &evil, [0u8; 32]).incomplete);
     }
 }
