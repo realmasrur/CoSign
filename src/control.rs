@@ -56,6 +56,7 @@ impl<V: Verifier> Quorum<V> {
 
 /// secp256k1 approver keys: `approver` = SEC1 public key, `sig` = 64-byte r||s over `msg`.
 #[cfg(feature = "k256")]
+#[derive(Clone, Copy)]
 pub struct Secp256k1Verifier;
 
 #[cfg(feature = "k256")]

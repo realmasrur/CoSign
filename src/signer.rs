@@ -8,6 +8,7 @@
 use crate::audit::{hex32, Log, Sink};
 use crate::change::Guard;
 use crate::control::{Approval, Quorum, Verifier};
+use crate::license::{Entitlements, Status};
 use crate::evm::{analyze, analyze_authorization, analyze_raw, EvmConfig, Pricer, SafeTx, Word};
 use crate::{Decision, Engine, Reason, Simulation, TxHash};
 use std::collections::HashMap;
@@ -37,6 +38,7 @@ pub struct CoSigner<K: Key, S: Sink, V: Verifier> {
     pub(crate) log: Log<S>,
     pub(crate) quorum: Quorum<V>,
     pub(crate) guard: Guard,
+    license: Option<Entitlements>,
     /// Makes retries idempotent: same digest, same signature, no double-counted velocity.
     signed: HashMap<TxHash, Signature>,
 }
@@ -51,7 +53,26 @@ impl<K: Key, S: Sink, V: Verifier> CoSigner<K, S, V> {
         quorum: Quorum<V>,
         loosen_delay_secs: u64,
     ) -> Self {
-        Self { cfg, engine, key, log, quorum, guard: Guard::new(loosen_delay_secs), signed: HashMap::new() }
+        Self { cfg, engine, key, log, quorum, guard: Guard::new(loosen_delay_secs), license: None, signed: HashMap::new() }
+    }
+
+    /// Attach the signed license. Signing stops once it is past its transition period.
+    pub fn with_license(mut self, l: Entitlements) -> Self {
+        self.license = Some(l);
+        self
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.engine.is_paused()
+    }
+
+    /// What approvers must sign to unpause right now.
+    pub fn unpause_message(&self) -> [u8; 32] {
+        self.quorum.msg()
+    }
+
+    pub fn license_status(&self) -> Option<Status> {
+        self.license.as_ref().map(|l| l.status())
     }
 
     /// Any single trigger may pause. Never depends on the log: pausing must always work.
@@ -90,6 +111,13 @@ impl<K: Key, S: Sink, V: Verifier> CoSigner<K, S, V> {
     }
 
     fn decide(&mut self, sim: Simulation, now: u64) -> Response {
+        if let Some(l) = &mut self.license {
+            l.observe(now);
+            if !l.may_sign() {
+                let _ = self.log.append(now, "block license expired".into());
+                return Response::Blocked(vec![Reason::LicenseExpired]);
+            }
+        }
 
         let cached = if !sim.incomplete && !self.engine.is_paused() {
             self.signed.get(&sim.tx_hash).copied()
@@ -168,6 +196,7 @@ mod tests {
     use crate::evm::{hex, safe_tx_hash, testenc, word, Addr, Asset};
     use crate::keccak::keccak256;
     use crate::price::{PriceBook, SignedPrice};
+    use crate::license::testkit::{sample, token, ISSUER};
     use crate::{Policy, Risk};
     use std::cell::RefCell;
 
@@ -467,5 +496,18 @@ mod tests {
         let r = s.request_authorization(&auth, keccak256(&auth), 1);
         assert!(matches!(r, Response::Blocked(ref x) if x.contains(&Reason::Risk(Risk::Delegation))));
         assert_eq!(s.key.calls.borrow().len(), 1); // only the legitimate transfer reached the key
+    }
+
+    #[test]
+    fn signing_continues_through_the_transition_then_stops() {
+        let ent = Entitlements::load(&token(&sample(3, 2_000)), 0, &ISSUER, &Tag).unwrap();
+        let mut s = signer(20_000, false).with_license(ent);
+        let t = transfer_tx(0, TOKEN, 600);
+        assert!(matches!(ask(&mut s, &t, 100), Response::Signed(_))); // active
+        let t2 = transfer_tx(0, TOKEN, 700);
+        assert!(matches!(ask(&mut s, &t2, 2_000 + 86_400), Response::Signed(_))); // transition
+        let after = 2_000 + 90 * 86_400 + 1;
+        assert_eq!(ask(&mut s, &t, after), Response::Blocked(vec![Reason::LicenseExpired]));
+        assert_eq!(s.key.calls.borrow().len(), 2);
     }
 }

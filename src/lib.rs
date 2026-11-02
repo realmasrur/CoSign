@@ -9,6 +9,7 @@ pub mod change;
 pub mod control;
 pub mod evm;
 pub mod keccak;
+pub mod license;
 pub mod price;
 pub mod signer;
 
@@ -103,6 +104,8 @@ pub enum Reason {
     WindowLimit,
     /// The cross-chain velocity limit shared by all engines would be exceeded.
     GlobalLimit,
+    /// The license is past its 90-day transition: signing is stopped.
+    LicenseExpired,
     SignerFailure,
     AuditFailure,
 }
