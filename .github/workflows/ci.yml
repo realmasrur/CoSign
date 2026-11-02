@@ -16,3 +16,11 @@ jobs:
         run: cargo test --features k256
       - name: Clippy
         run: cargo clippy --all-features
+  service:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test service
+        run: cargo test
+        working-directory: service
