@@ -1,0 +1,18 @@
+[package]
+name = "cosign-service"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "mTLS signing service that wraps the CoSign policy engine"
+license-file = "../LICENSE"
+publish = false
+
+# Its own workspace root, so it builds independently of the std-only library crate.
+[workspace]
+
+[dependencies]
+cosign-policy = { path = "..", features = ["k256"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"

@@ -1,0 +1,36 @@
+{
+  "listen": "0.0.0.0:8443",
+  "tls": { "cert": "/etc/cosign/server.pem", "key": "/etc/cosign/server.key", "client_ca": "/etc/cosign/client-ca.pem" },
+  "license_file": "/etc/cosign/acme.lic",
+  "issuer_pubkey": "02<33-byte compressed issuer public key, hex>",
+  "global": { "window_secs": 86400, "max_usd_cents": 5000000000 },
+  "approvers": ["02<approver 1 public key>", "02<approver 2 public key>", "02<approver 3 public key>"],
+  "quorum": 2,
+  "loosen_delay_secs": 86400,
+  "price_feeds": ["02<feed 1 public key>", "02<feed 2 public key>", "02<feed 3 public key>"],
+  "price_threshold": 2,
+  "price_max_validity_secs": 300,
+  "callers": {
+    "sign": ["<hex keccak256 of the withdrawal system's client certificate (DER)>"],
+    "pause": ["<hex keccak256 of each incident-response client certificate (DER)>"]
+  },
+  "chains": [
+    {
+      "chain_id": 1,
+      "account": "0x<guarded Safe or hot wallet address>",
+      "multisend": ["0x<MultiSend contract>"],
+      "allowed_delegates": [],
+      "key_file": "/run/cosign/eth.key",
+      "audit_log": "/var/lib/cosign/audit-1.log",
+      "policy": {
+        "max_tx_usd_cents": 50000000,
+        "window_secs": 3600,
+        "max_window_usd_cents": 200000000,
+        "delay_above_usd_cents": 20000000,
+        "delay_secs": 900,
+        "allow_list": ["0x<cold wallet or treasury address>"],
+        "unlisted_max_usd_cents": 5000000
+      }
+    }
+  ]
+}
