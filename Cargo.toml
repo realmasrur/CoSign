@@ -1,6 +1,6 @@
 [package]
 name = "cosign-policy"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Masrur Ahmmed"]
 edition = "2021"
 rust-version = "1.70"
@@ -9,6 +9,10 @@ license-file = "LICENSE"
 publish = false
 readme = "README.md"
 keywords = ["crypto", "security", "multisig", "custody", "policy"]
+
+[[example]]
+name = "issue_license"
+required-features = ["k256"]
 
 [dependencies]
 k256 = { version = "0.13", optional = true }

@@ -36,3 +36,7 @@ reviewed independently before it guards live funds.
 9. The global cross-chain limit has no runtime change path by design. Changing it requires redeploying the attested enclave, so size it with operational headroom.
 10. Raw transactions are analyzed from the exact bytes supplied for signing. The caller must supply the bytes that the key or MPC backend will actually sign.
 11. Prices, `EvmConfig` and policy are per chain; a misconfigured chain id fails closed because transactions and signed prices bind the chain id.
+12. License enforcement in the source build is advisory; it is backed by the license terms and audit rights. Production customers that need technical enforcement should run Licensor-signed enclave builds. The license clock only moves forward; supply a trusted time source.
+13. The service handles one request per connection and serializes signing behind a single lock. It bounds header and body sizes and sets timeouts, but does not rate-limit; put a connection limit in front of it.
+14. The audit file sink starts a new hash chain on each process start. Use durable, host-proof storage and anchor the chain head externally.
+15. The service reads its signing key from a 0600 file. Provision it inside the enclave and never persist it on the host.

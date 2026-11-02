@@ -68,6 +68,8 @@ If any step fails, nothing is signed.
 | `src/audit.rs` | Hash-chained audit log. No signature is released without a durable log entry. |
 | `src/control.rs` | Pause by any single trigger; unpause only by quorum, bound to an epoch so approvals cannot be replayed. |
 | `src/change.rs` | Policy changes: tighten instantly with one approver; loosen with quorum, timelock and veto. |
+| `src/license.rs` | Signed license tokens: plan limits (chains, features, platforms) enforced offline, with a 90-day transition. |
+| `service/` | The mTLS signing service: `/sign`, `/prices`, `/pause`, `/unpause`, `/health`. Separate crate with its own dependencies. |
 | `src/keccak.rs` | Dependency-free Keccak-256. |
 
 ## Security properties
@@ -93,11 +95,46 @@ CoSign protects a wallet only when deployed as designed:
 5. **One instance per chain**, each with its own `EvmConfig` and `PriceBook`, all attached to one shared `GlobalLimit`.
 6. **Sensible limits.** Set per-chain and global limits relative to your real withdrawal flow. The limits are what bound the loss.
 
+## Plan enforcement
+
+Plans are enforced by a **signed license token**, checked offline inside the enclave. The token
+names the licensee, plan, chain limit, feature flags, covered platforms and expiry, and is signed
+with an offline issuer key; the enclave embeds only the public key. There is no call-home and no
+remote disable, so a compromise of the licensor cannot switch off protection at any exchange.
+
+- Chain count, integrations (MPC adapters, non-EVM) and covered platforms are gated by the token. Security controls are identical on every plan.
+- At expiry there is a 90-day transition: existing protection keeps signing but no new chains load. After that, signing stops, and warnings are available at 30, 14 and 7 days via `Status`.
+- Tokens are issued with `examples/issue_license.rs` on an offline machine.
+
+## Running the service
+
+`service/` wraps the library in an mTLS API (TLS 1.3 only, no plaintext mode). Every client must
+present a certificate from your client CA, and each endpoint is limited to the certificate
+fingerprints listed for it. Time comes from the enclave clock, never from the request.
+
+| Endpoint | Who may call | Purpose |
+|---|---|---|
+| `POST /sign` | withdrawal system | Safe, raw hot-wallet or EIP-7702 authorization requests. `200` signed, `202` delayed, `403` blocked. |
+| `POST /prices` | price relay | Signed price feed messages. |
+| `POST /pause` | incident-response certificates | Pause every chain. |
+| `POST /unpause` | anyone holding a quorum of approver signatures | Resume every chain. |
+| `GET /health` | any valid client | Pause state, license status, and the message approvers sign to unpause. |
+
+```
+cd service
+cargo run --release -- /etc/cosign/config.json     # see service/config.example.json
+```
+
+At startup each configured chain loads the license and is checked against the plan's chain limit.
+Run it inside the enclave and forward only TCP bytes from the host (for example over vsock), so TLS
+terminates inside the enclave and the host cannot read or alter requests.
+
 ## Scope of this release
 
 This release provides the policy, decoding, pricing, signing, audit and governance core for **EVM chains**, covering **Safe multisig withdrawals** and **raw hot-wallet transactions**, including EIP-7702 handling. Plan integration around what is not included:
 
-- Network service, enclave host and attested key provisioning (AWS Nitro, SGX or HSM).
+- Enclave image build and attested key provisioning (AWS Nitro, SGX or HSM). The service reads its key from a protected file; replace that with a KMS-attested unseal in production.
+- Policy-change and veto endpoints. The governance logic is in the library; the service does not expose it yet.
 - MPC protocol adapters. `Key` is the integration point; the policy gate in front of it is what this release delivers.
 - Non-EVM chains. The `GlobalLimit` is chain-agnostic and is ready to be shared by future chain adapters.
 - State-based EVM simulation. Decoding is static; calldata CoSign cannot explain is blocked rather than simulated.
